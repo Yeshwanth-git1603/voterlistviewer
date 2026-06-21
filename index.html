@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+<title>Voter Search</title>
+<style>
+  :root{
+    --bg:#0f1115; --card:#191c23; --card2:#21252e; --line:#2c313c;
+    --text:#e8eaed; --muted:#9aa3b2; --accent:#5b8cff; --accent2:#1f6feb;
+    --good:#3fb950;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans Telugu",sans-serif;
+       background:var(--bg);color:var(--text);font-size:15px;line-height:1.4}
+  header{position:sticky;top:0;background:var(--bg);border-bottom:1px solid var(--line);
+         padding:12px 14px;z-index:5}
+  h1{font-size:17px;margin:0 0 8px}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  label{color:var(--muted);font-size:13px}
+  select{background:var(--card2);color:var(--text);border:1px solid var(--line);
+         border-radius:8px;padding:6px 8px;font-size:14px}
+  .wrap{padding:12px 14px;max-width:760px;margin:0 auto}
+  .box{background:var(--card);border:1px solid var(--line);border-radius:12px;
+       padding:12px;margin-bottom:14px}
+  .search{display:flex;gap:8px;align-items:center}
+  input[type=text]{flex:1;background:var(--card2);color:var(--text);border:1px solid var(--line);
+        border-radius:9px;padding:11px 12px;font-size:16px}
+  input[type=text]:focus{outline:none;border-color:var(--accent)}
+  .meta{color:var(--muted);font-size:12px;margin:8px 2px 4px}
+  .results{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+  .voter{background:var(--card2);border:1px solid var(--line);border-radius:10px;padding:10px 11px}
+  .name{font-size:16px;font-weight:600}
+  .sub{color:var(--muted);font-size:13px;margin-top:3px;display:flex;flex-wrap:wrap;gap:4px 12px}
+  .pill{background:#0d1018;border:1px solid var(--line);border-radius:6px;padding:1px 7px;font-size:12px;color:var(--muted)}
+  .epic{font-variant-numeric:tabular-nums;color:var(--accent)}
+  #loading{padding:24px 14px;text-align:center;color:var(--muted)}
+  .bar{height:8px;background:var(--card2);border-radius:6px;overflow:hidden;margin:12px auto;max-width:320px}
+  .bar > i{display:block;height:100%;width:0;background:var(--accent2);transition:width .15s}
+  .empty{color:var(--muted);font-size:13px;padding:4px 2px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Voter Search</h1>
+  <div class="row">
+    <label for="count">Search boxes:</label>
+    <select id="count">
+      <option>1</option><option>2</option><option>3</option><option>4</option><option>5</option>
+      <option>6</option><option>7</option><option>8</option><option>9</option><option>10</option>
+    </select>
+    <span id="status" class="meta"></span>
+  </div>
+</header>
+
+<div id="loading">
+  <div>Loading voter database…</div>
+  <div class="bar"><i id="prog"></i></div>
+  <div id="loadnote" class="meta">First load downloads ~12MB once, then it is cached on your phone.</div>
+</div>
+
+<div class="wrap" id="app" style="display:none"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
+<script>
+const DB_URL = "voters.db.gz";     // gzipped SQLite, placed next to this file
+const IDB_NAME = "voterdb", IDB_KEY = "bytes_v1";
+const MAX_RESULTS = 100;           // cap rows rendered per box
+
+let db = null;
+
+// ---------- tiny IndexedDB cache so the DB downloads only once ----------
+function idb(mode, fn){
+  return new Promise((res,rej)=>{
+    const r = indexedDB.open(IDB_NAME,1);
+    r.onupgradeneeded = ()=> r.result.createObjectStore("kv");
+    r.onerror = ()=> rej(r.error);
+    r.onsuccess = ()=>{
+      const tx = r.result.transaction("kv",mode);
+      const out = fn(tx.objectStore("kv"));
+      tx.oncomplete = ()=> res(out && out.result);
+      tx.onerror = ()=> rej(tx.error);
+    };
+  });
+}
+const cacheGet = ()=> idb("readonly", s=> s.get(IDB_KEY));
+const cacheSet = (b)=> idb("readwrite", s=> s.put(b, IDB_KEY));
+
+// ---------- download + gunzip the DB ----------
+async function fetchDbBytes(onProgress){
+  const resp = await fetch(DB_URL);
+  if(!resp.ok) throw new Error("Could not fetch "+DB_URL+" ("+resp.status+")");
+  const total = +(resp.headers.get("content-length") || 0);
+  // stream-decompress gzip in the browser
+  const ds = new DecompressionStream("gzip");
+  const stream = resp.body.pipeThrough(ds);
+  const reader = stream.getReader();
+  const chunks = []; let got = 0;
+  // progress is approximate (post-decompression), good enough for a bar
+  const rawReader = resp.clone ? null : null;
+  while(true){
+    const {done,value} = await reader.read();
+    if(done) break;
+    chunks.push(value); got += value.length;
+    if(total) onProgress(Math.min(0.95, got/(total*4))); // ~4x expansion estimate
+    else onProgress(0.5);
+  }
+  onProgress(1);
+  let len = chunks.reduce((a,c)=>a+c.length,0);
+  const bytes = new Uint8Array(len); let off=0;
+  for(const c of chunks){ bytes.set(c,off); off+=c.length; }
+  return bytes;
+}
+
+async function boot(){
+  const prog = document.getElementById("prog");
+  const setProg = p=> prog.style.width = Math.round(p*100)+"%";
+  try{
+    const SQL = await initSqlJs({
+      locateFile: f => "https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/"+f
+    });
+    let bytes = await cacheGet();
+    if(!bytes){
+      bytes = await fetchDbBytes(setProg);
+      try{ await cacheSet(bytes); }catch(e){ /* private mode etc, ignore */ }
+    }else{
+      document.getElementById("loadnote").textContent = "Loaded from cache.";
+      setProg(1);
+    }
+    db = new SQL.Database(bytes);
+    const n = db.exec("SELECT count(*) FROM voters")[0].values[0][0];
+    document.getElementById("status").textContent = n.toLocaleString()+" voters loaded";
+    document.getElementById("loading").style.display = "none";
+    document.getElementById("app").style.display = "";
+    render();
+  }catch(err){
+    document.getElementById("loading").innerHTML =
+      '<div style="color:#f85149">Failed to load database.<br>'+err.message+'</div>';
+  }
+}
+
+// ---------- search ----------
+function search(term){
+  term = term.trim();
+  if(!term) return [];
+  const like = "%"+term+"%";
+  const isNum = /^[0-9]+$/.test(term);
+  // name / relation name / epic / door always; part_no only on exact numeric match
+  const sql = `
+    SELECT part_no, sl_no, door_no, voter_name, relation, relation_name, gender, age, epic_id
+    FROM voters
+    WHERE voter_name LIKE $q
+       OR relation_name LIKE $q
+       OR epic_id LIKE $q
+       OR door_no LIKE $q
+       ${isNum ? "OR part_no = $exact" : ""}
+    LIMIT ${MAX_RESULTS+1}`;
+  const st = db.prepare(sql);
+  st.bind(isNum ? {$q:like,$exact:term} : {$q:like});
+  const rows = [];
+  while(st.step()) rows.push(st.getAsObject());
+  st.free();
+  return rows;
+}
+
+function voterCard(v){
+  const g = v.gender==="పు"?"M":v.gender==="స్త్రీ"||v.gender==="మ"?"F":v.gender||"";
+  return `<div class="voter">
+    <div class="name">${esc(v.voter_name)}</div>
+    <div class="sub">
+      <span>${esc(v.relation||"")} ${esc(v.relation_name||"")}</span>
+    </div>
+    <div class="sub">
+      <span class="pill">Part ${esc(v.part_no)}</span>
+      <span class="pill">Sl ${esc(v.sl_no)}</span>
+      <span class="pill">Age ${esc(v.age)}</span>
+      <span class="pill">${esc(g)}</span>
+      <span class="epic">${esc(v.epic_id||"")}</span>
+    </div>
+  </div>`;
+}
+function esc(s){return String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));}
+
+// ---------- UI ----------
+function debounce(fn,ms){let t;return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};}
+
+function makeBox(i){
+  const box = document.createElement("div");
+  box.className = "box";
+  box.innerHTML = `
+    <div class="search">
+      <input type="text" placeholder="Search name, EPIC, relation, door…" inputmode="search" />
+    </div>
+    <div class="meta"></div>
+    <div class="results"></div>`;
+  const input = box.querySelector("input");
+  const meta = box.querySelector(".meta");
+  const out = box.querySelector(".results");
+  const run = debounce(()=>{
+    const q = input.value.trim();
+    if(!q){ meta.textContent=""; out.innerHTML=""; return; }
+    const t0 = performance.now();
+    const rows = search(q);
+    const more = rows.length>MAX_RESULTS;
+    const show = rows.slice(0,MAX_RESULTS);
+    meta.textContent = show.length
+      ? `${more?MAX_RESULTS+"+":show.length} match${show.length>1?"es":""} · ${Math.round(performance.now()-t0)}ms`
+      : "No matches";
+    out.innerHTML = show.length ? show.map(voterCard).join("")
+                                : '<div class="empty">Nothing found for “'+esc(q)+'”.</div>';
+  },220);
+  input.addEventListener("input",run);
+  return box;
+}
+
+function render(){
+  const app = document.getElementById("app");
+  const count = +document.getElementById("count").value;
+  app.innerHTML = "";
+  for(let i=0;i<count;i++) app.appendChild(makeBox(i));
+}
+document.getElementById("count").addEventListener("change",render);
+
+boot();
+</script>
+</body>
+</html>
